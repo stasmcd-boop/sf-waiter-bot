@@ -665,55 +665,71 @@ def scrape_site_menu(site_url: str) -> Dict[str, Any]:
         site_url.rstrip("/") + "/sitemap",
     ]
 
-    xml_text = None
+    raw_text = None
     last_error = None
     for sm_url in sitemap_urls:
         try:
-            xml_text = fetch_url(sm_url, expect_xml=True)
-            if "<urlset" in xml_text or "<sitemapindex" in xml_text:
+            raw_text = fetch_url(sm_url, expect_xml=True)
+            if raw_text:
                 break
         except Exception as e:
             last_error = e
 
-    if not xml_text:
+    if not raw_text:
         raise RuntimeError(f"Не удалось получить sitemap: {last_error}")
 
-    try:
-        root = ET.fromstring(xml_text)
-    except Exception as e:
-        raise RuntimeError(f"Не удалось распарсить sitemap.xml: {e}")
-
     urls: List[str] = []
-    tag = root.tag.lower()
 
-    if tag.endswith("urlset"):
-        for elem in root.iter():
-            if elem.tag.lower().endswith("loc") and elem.text:
-                urls.append(elem.text.strip())
-    elif tag.endswith("sitemapindex"):
-        child_sitemaps = [elem.text.strip() for elem in root.iter() if elem.tag.lower().endswith("loc") and elem.text]
-        for child in child_sitemaps[:20]:
-            try:
-                child_xml = fetch_url(child, expect_xml=True)
-                child_root = ET.fromstring(child_xml)
-                for elem in child_root.iter():
-                    if elem.tag.lower().endswith("loc") and elem.text:
-                        urls.append(elem.text.strip())
-            except Exception:
-                continue
-    else:
-        raise RuntimeError("Формат sitemap не распознан.")
+    # 1) Сначала пробуем нормальный XML
+    try:
+        root = ET.fromstring(raw_text)
+        tag = root.tag.lower()
 
-    menu_urls = []
+        if tag.endswith("urlset"):
+            for elem in root.iter():
+                if elem.tag.lower().endswith("loc") and elem.text:
+                    urls.append(elem.text.strip())
+
+        elif tag.endswith("sitemapindex"):
+            child_sitemaps = [
+                elem.text.strip()
+                for elem in root.iter()
+                if elem.tag.lower().endswith("loc") and elem.text
+            ]
+            for child in child_sitemaps[:20]:
+                try:
+                    child_xml = fetch_url(child, expect_xml=True)
+                    try:
+                        child_root = ET.fromstring(child_xml)
+                        for elem in child_root.iter():
+                            if elem.tag.lower().endswith("loc") and elem.text:
+                                urls.append(elem.text.strip())
+                    except Exception:
+                        # fallback для "грязного" дочернего sitemap
+                        urls.extend(re.findall(r"https?://[^\\s<>\\\"]+", child_xml))
+                except Exception:
+                    continue
+
+    # 2) Если XML кривой, вытаскиваем ссылки regex-ом
+    except Exception:
+        urls = re.findall(r"https?://[^\\s<>\\\"]+", raw_text)
+
+    clean_urls: List[str] = []
+    host_key = site_url.replace("https://", "").replace("http://", "").strip("/")
+
     for url in urls:
-        if "/menu/" in url:
-            menu_urls.append(url.split("?")[0].rstrip("/"))
+        url = url.strip().rstrip(",")
+        if host_key in url:
+            clean_urls.append(url.split("?")[0].rstrip("/"))
+
+    menu_urls = sorted(set(url for url in clean_urls if "/menu/" in url))
 
     if not menu_urls:
         raise RuntimeError("В sitemap не найдено ссылок с /menu/")
 
     category_map: Dict[str, Dict[str, Any]] = {}
 
+    # 3) Создаём категории из URL
     for url in menu_urls:
         path = urlparse(url).path.strip("/")
         parts = path.split("/")
@@ -734,6 +750,7 @@ def scrape_site_menu(site_url: str) -> Dict[str, Any]:
                 },
             )
 
+    # 4) Загружаем карточки товаров
     for url in menu_urls:
         path = urlparse(url).path.strip("/")
         parts = path.split("/")
@@ -755,6 +772,7 @@ def scrape_site_menu(site_url: str) -> Dict[str, Any]:
 
             soup = BeautifulSoup(html, "html.parser")
             text = normalize_space(soup.get_text(" ", strip=True))
+
             title = extract_title(soup, item_slug)
             weight, price = parse_weight_price(text)
             composition = extract_composition(text)
@@ -773,6 +791,7 @@ def scrape_site_menu(site_url: str) -> Dict[str, Any]:
             }
             category["items"].append(item)
 
+    # 5) Убираем дубли
     categories = []
     for category in category_map.values():
         unique = {}
@@ -792,7 +811,7 @@ def scrape_site_menu(site_url: str) -> Dict[str, Any]:
 
     return {
         "brand": "SF Shaurma Food",
-        "source_note": f"Синхронизировано через sitemap.xml {datetime.now().strftime('%Y-%m-%d %H:%M')}",
+        "source_note": f"Синхронизировано с сайта {datetime.now().strftime('%Y-%m-%d %H:%M')}",
         "categories": categories,
     }
 
