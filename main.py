@@ -9,10 +9,11 @@ import os
 import random
 import re
 import sqlite3
-from dataclasses import dataclass
+import xml.etree.ElementTree as ET
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import urlparse
 
 import requests
 from bs4 import BeautifulSoup
@@ -40,7 +41,7 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
     level=logging.INFO,
 )
-logger = logging.getLogger("sf_waiter_ai_bot_v2")
+logger = logging.getLogger("sf_waiter_ai_bot_v3")
 
 BASE_DIR = Path(__file__).resolve().parent
 DB_PATH = BASE_DIR / "bot.db"
@@ -81,6 +82,7 @@ CATEGORY_NAME_MAP = {
     "desserty_i_bliny": "Десерты & Блины",
     "drinks": "Напитки",
     "sezonnoe_menyu": "Сезонное меню",
+    "goryachie_napitki": "Горячие напитки",
 }
 
 EMOJI_BY_NAME = {
@@ -104,6 +106,7 @@ EMOJI_BY_NAME = {
     "Десерты & Блины": "🧁",
     "Напитки": "🥤",
     "Сезонное меню": "🌟",
+    "Горячие напитки": "☕",
 }
 
 SALES_SCENARIOS = [
@@ -328,11 +331,16 @@ def site_sync_summary(menu_data: Dict[str, Any]) -> str:
 
 def parse_weight_price(text: str) -> Tuple[str, str]:
     text = normalize_space(text)
-    weight_match = re.search(r"(\d+[.,]?\d*)\s*(г|g|кг|kg|л|ml|мл)", text, flags=re.I)
+    weight_match = re.search(r"(\d+[.,]?\d*)\s*(г|kg|кг|л|ml|мл)\b", text, flags=re.I)
     price_match = re.search(r"(от\s*)?(\d[\d\s]*)\s*₸", text)
     weight = weight_match.group(0) if weight_match else "—"
     price = price_match.group(0) if price_match else "—"
     return weight, price
+
+
+def make_item_id(name: str) -> str:
+    text = re.sub(r"[^a-zA-Z0-9а-яА-Я]+", "_", name.lower()).strip("_")
+    return text[:80] or "item"
 
 
 def build_learning_fields(item: Dict[str, Any], category_name: str) -> Dict[str, Any]:
@@ -341,8 +349,8 @@ def build_learning_fields(item: Dict[str, Any], category_name: str) -> Dict[str,
     if category_name == "Шаурма":
         guest_fit = "Подходит гостям, которые хотят быстро, сытно и понятно."
         objections = [
-            "Если гость сомневается между курицей и говядиной — объясни разницу по вкусу, а не составом.",
-            "Если гость боится, что будет слишком тяжело — предложи меньший формат или напиток без газа.",
+            "Если гость сомневается между курицей и говядиной — объясни разницу по вкусу, а не просто составом.",
+            "Если гость боится, что будет слишком тяжело — предложи меньший формат или более лёгкий напиток.",
         ]
         pitch = f"{name} — это сытный и понятный вариант, который легко рекомендовать, когда гость не хочет долго выбирать."
         upsell = ["Напиток", "Соус", "Картофель"]
@@ -354,7 +362,7 @@ def build_learning_fields(item: Dict[str, Any], category_name: str) -> Dict[str,
         ]
         pitch = f"{name} удобно продавать как готовое решение без сложного выбора."
         upsell = ["Напиток 1 л", "Десерт", "Доп. соус"]
-    elif category_name in {"Десерты & Блины", "Завтраки"}:
+    elif category_name in {"Десерты & Блины", "Завтраки", "Горячие напитки"}:
         guest_fit = "Подходит, когда гость хочет мягкий, понятный или сладкий вкус."
         objections = [
             "Если гость уже взял кофе — помоги быстро подобрать сладкую пару.",
@@ -365,11 +373,11 @@ def build_learning_fields(item: Dict[str, Any], category_name: str) -> Dict[str,
     else:
         guest_fit = "Подходит гостям, которые хотят понятный вкус и быстрый выбор."
         objections = [
-            "Сначала уточни предпочтение: мясо/полегче/острее/для компании.",
+            "Сначала уточни предпочтение: мясо, полегче, поострее или для компании.",
             "Не перечисляй всё подряд — лучше предложить 1–2 релевантные позиции.",
         ]
         pitch = item.get("sell_pitch") or f"{name} — понятная позиция, которую удобно рекомендовать по запросу гостя."
-        upsell = item.get("upsell", ["Напиток"])
+        upsell = item.get("upsell") or ["Напиток"]
 
     return {
         "guest_fit": guest_fit,
@@ -498,10 +506,11 @@ def generate_quiz_questions(menu_data: Dict[str, Any], count: int = 7) -> List[D
         random.shuffle(pool)
         options = [item["name"]] + pool[:3]
         random.shuffle(options)
+        hint = item.get("quiz_hint") or f"Позиция из категории {cat['name']}"
         questions.append({
             "category": cat["name"],
             "item_name": item["name"],
-            "question": f"Какое блюдо подходит под описание: {item.get('quiz_hint', f'Позиция из категории {cat['name']}')}",
+            "question": f"Какое блюдо подходит под описание: {hint}",
             "options": options,
             "answer": item["name"],
         })
@@ -617,133 +626,175 @@ async def ai_evaluate(menu_data: Dict[str, Any], scenario: Dict[str, Any], answe
         return evaluate_locally(answer, scenario)
 
 
-def fetch_url(url: str) -> str:
+def fetch_url(url: str, expect_xml: bool = False) -> str:
     headers = {
         "User-Agent": "Mozilla/5.0 (compatible; SFWaiterBot/1.0)",
         "Accept-Language": "ru,en;q=0.9",
+        "Accept": "application/xml,text/xml,text/html;q=0.9,*/*;q=0.8" if expect_xml else "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     }
     resp = requests.get(url, headers=headers, timeout=30)
     resp.raise_for_status()
     return resp.text
 
 
-def extract_links(html: str, base_url: str) -> List[str]:
-    soup = BeautifulSoup(html, "html.parser")
-    links = []
-    for a in soup.find_all("a", href=True):
-        href = a["href"].strip()
-        if href.startswith("/"):
-            href = base_url.rstrip("/") + href
-        if href.startswith(base_url):
-            links.append(href.split("?")[0])
-    return sorted(set(links))
+def extract_title(soup: BeautifulSoup, fallback_slug: str) -> str:
+    meta_og = soup.find("meta", attrs={"property": "og:title"})
+    if meta_og and meta_og.get("content"):
+        return normalize_space(meta_og["content"].split("|")[0])
+    h1 = soup.find("h1")
+    if h1:
+        return normalize_space(h1.get_text(" ", strip=True))
+    title = soup.find("title")
+    if title:
+        return normalize_space(title.get_text(" ", strip=True).split("|")[0])
+    return fallback_slug.replace("_", " ").replace("-", " ").title()
 
 
-def make_item_id(name: str) -> str:
-    text = re.sub(r"[^a-zA-Z0-9а-яА-Я]+", "_", name.lower()).strip("_")
-    return text[:80] or "item"
+def extract_composition(text: str) -> str:
+    markers = ["Состав", "Ингредиенты", "Ingredients"]
+    for marker in markers:
+        m = re.search(rf"{marker}\s*[:\-]?\s*(.+?)(Цена|₸|Вес|Ккал|$)", text, flags=re.I)
+        if m:
+            return normalize_space(m.group(1))[:300]
+    return "Описание и точный состав уточняются по карточке блюда на сайте."
 
 
 def scrape_site_menu(site_url: str) -> Dict[str, Any]:
-    # Strategy:
-    # 1) open sitemap if available
-    # 2) collect /menu/<category> and /menu/<category>/<item> links
-    # 3) parse category pages for product cards
-    sitemap_url = site_url.rstrip("/") + "/sitemap"
-    try:
-        html = fetch_url(sitemap_url)
-    except Exception:
-        html = fetch_url(site_url)
+    sitemap_urls = [
+        site_url.rstrip("/") + "/sitemap.xml",
+        site_url.rstrip("/") + "/sitemap",
+    ]
 
-    links = extract_links(html, site_url)
-    menu_links = [x for x in links if "/menu/" in x]
+    xml_text = None
+    last_error = None
+    for sm_url in sitemap_urls:
+        try:
+            xml_text = fetch_url(sm_url, expect_xml=True)
+            if "<urlset" in xml_text or "<sitemapindex" in xml_text:
+                break
+        except Exception as e:
+            last_error = e
+
+    if not xml_text:
+        raise RuntimeError(f"Не удалось получить sitemap: {last_error}")
+
+    try:
+        root = ET.fromstring(xml_text)
+    except Exception as e:
+        raise RuntimeError(f"Не удалось распарсить sitemap.xml: {e}")
+
+    urls: List[str] = []
+    tag = root.tag.lower()
+
+    if tag.endswith("urlset"):
+        for elem in root.iter():
+            if elem.tag.lower().endswith("loc") and elem.text:
+                urls.append(elem.text.strip())
+    elif tag.endswith("sitemapindex"):
+        child_sitemaps = [elem.text.strip() for elem in root.iter() if elem.tag.lower().endswith("loc") and elem.text]
+        for child in child_sitemaps[:20]:
+            try:
+                child_xml = fetch_url(child, expect_xml=True)
+                child_root = ET.fromstring(child_xml)
+                for elem in child_root.iter():
+                    if elem.tag.lower().endswith("loc") and elem.text:
+                        urls.append(elem.text.strip())
+            except Exception:
+                continue
+    else:
+        raise RuntimeError("Формат sitemap не распознан.")
+
+    menu_urls = []
+    for url in urls:
+        if "/menu/" in url:
+            menu_urls.append(url.split("?")[0].rstrip("/"))
+
+    if not menu_urls:
+        raise RuntimeError("В sitemap не найдено ссылок с /menu/")
+
     category_map: Dict[str, Dict[str, Any]] = {}
 
-    # infer categories from links
-    for link in menu_links:
-        parts = link.rstrip("/").split("/")
-        try:
-            idx = parts.index("menu")
-        except ValueError:
-            continue
-        if len(parts) <= idx + 1:
-            continue
-        category_slug = parts[idx + 1]
-        category_name = slug_to_name(category_slug)
-        if category_slug not in category_map:
-            category_map[category_slug] = {
-                "slug": category_slug,
-                "name": category_name,
-                "emoji": name_to_emoji(category_name),
-                "items": []
-            }
+    for url in menu_urls:
+        path = urlparse(url).path.strip("/")
+        parts = path.split("/")
 
-    # parse category pages
-    for category_slug, category in list(category_map.items()):
-        url = f"{site_url.rstrip('/')}/menu/{category_slug}"
-        try:
-            cat_html = fetch_url(url)
-        except Exception:
-            continue
+        if parts[:1] == ["en"]:
+            parts = parts[1:]
 
-        soup = BeautifulSoup(cat_html, "html.parser")
-        text = soup.get_text("\n", strip=True)
-        lines = [normalize_space(x) for x in text.splitlines() if normalize_space(x)]
-        # rough parser: find lines that look like product title + nearby weight/price
-        seen = set()
-        for i, line in enumerate(lines):
-            if len(line) < 2 or len(line) > 120:
-                continue
-            if any(line.lower() == c["name"].lower() for c in category_map.values()):
-                continue
-
-            next_block = " ".join(lines[i:i+4])
-            weight, price = parse_weight_price(next_block)
-
-            # Heuristic: item line near weight/price or followed by them
-            looks_like_item = (
-                price != "—" or weight != "—" or
-                any(tok in next_block.lower() for tok in ["₸", "г", "g", "new", "новинка", "from"])
+        if len(parts) >= 2 and parts[0] == "menu":
+            category_slug = parts[1]
+            category_name = slug_to_name(category_slug)
+            category_map.setdefault(
+                category_slug,
+                {
+                    "slug": category_slug,
+                    "name": category_name,
+                    "emoji": name_to_emoji(category_name),
+                    "items": [],
+                },
             )
-            bad = re.search(r"^(меню|назад|доставка|корзина|вход|регистрация|контакты|политика)", line.lower())
-            if looks_like_item and not bad and line.lower() not in seen:
-                seen.add(line.lower())
-                category["items"].append({
-                    "id": make_item_id(line),
-                    "name": line,
-                    "weight": weight,
-                    "price": price,
-                    "composition": "Описание и точный состав уточняются по карточке блюда на сайте.",
-                    "sell_pitch": "",
-                    "upsell": [],
-                    "features": [],
-                    "quiz_hint": f"Позиция из категории {category['name']}.",
-                })
 
-        # Deduplicate and trim obvious junk
-        cleaned = []
-        bad_words = ["telegram", "instagram", "facebook", "copyright", "заказать", "добавить", "оформить", "в корзину"]
-        for item in category["items"]:
-            low = item["name"].lower()
-            if any(x in low for x in bad_words):
+    for url in menu_urls:
+        path = urlparse(url).path.strip("/")
+        parts = path.split("/")
+
+        if parts[:1] == ["en"]:
+            parts = parts[1:]
+
+        if len(parts) >= 3 and parts[0] == "menu":
+            category_slug = parts[1]
+            item_slug = parts[2]
+            category = category_map.get(category_slug)
+            if not category:
                 continue
-            if len(item["name"]) < 3:
+
+            try:
+                html = fetch_url(url)
+            except Exception:
                 continue
-            cleaned.append(item)
-        # preserve order, unique names
+
+            soup = BeautifulSoup(html, "html.parser")
+            text = normalize_space(soup.get_text(" ", strip=True))
+            title = extract_title(soup, item_slug)
+            weight, price = parse_weight_price(text)
+            composition = extract_composition(text)
+
+            item = {
+                "id": make_item_id(item_slug),
+                "name": title,
+                "weight": weight,
+                "price": price,
+                "composition": composition,
+                "sell_pitch": "",
+                "upsell": [],
+                "features": [],
+                "quiz_hint": f"Позиция из категории {category['name']}.",
+                "source_url": url,
+            }
+            category["items"].append(item)
+
+    categories = []
+    for category in category_map.values():
         unique = {}
-        for item in cleaned:
-            unique.setdefault(item["name"], item)
-        category["items"] = list(unique.values())[:120]
+        for item in category["items"]:
+            key = item["name"].lower().strip()
+            if key and key not in unique:
+                unique[key] = item
+        category["items"] = list(unique.values())
+        if category["items"]:
+            category["items"].sort(key=lambda x: x["name"])
+            categories.append(category)
 
-    categories = [x for x in category_map.values() if x["items"]]
     categories.sort(key=lambda x: x["name"])
-    data = {
+
+    if not categories:
+        raise RuntimeError("Не удалось собрать ни одной категории с позициями.")
+
+    return {
         "brand": "SF Shaurma Food",
-        "source_note": f"Синхронизировано с сайта {site_url} {datetime.now().strftime('%Y-%m-%d %H:%M')}",
+        "source_note": f"Синхронизировано через sitemap.xml {datetime.now().strftime('%Y-%m-%d %H:%M')}",
         "categories": categories,
     }
-    return data
 
 
 async def sync_menu_from_site(context: ContextTypes.DEFAULT_TYPE) -> Dict[str, Any]:
@@ -1087,10 +1138,11 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             random.shuffle(pool)
             opts = [item["name"]] + pool[:3]
             random.shuffle(opts)
+            hint = item.get("quiz_hint") or f"Позиция из категории {category['name']}"
             questions.append({
                 "category": category["name"],
                 "item_name": item["name"],
-                "question": f"Какое блюдо подходит под описание: {item.get('quiz_hint', f'Позиция из категории {category['name']}')}",
+                "question": f"Какое блюдо подходит под описание: {hint}",
                 "options": opts,
                 "answer": item["name"],
             })
@@ -1138,7 +1190,7 @@ async def cmd_sync_site(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 async def cmd_menu_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     menu_data = context.bot_data["menu_data"]
     lines = ["*Статистика меню*\n", site_sync_summary(menu_data), ""]
-    for cat in menu_data.get("categories", [])[:25]:
+    for cat in menu_data.get("categories", [])[:30]:
         lines.append(f"• {cat['name']}: {len(cat.get('items', []))} поз.")
     await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
 
