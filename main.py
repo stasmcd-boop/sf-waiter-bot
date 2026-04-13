@@ -9,11 +9,10 @@ import os
 import random
 import re
 import sqlite3
-import xml.etree.ElementTree as ET
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
 
 import requests
 from bs4 import BeautifulSoup
@@ -41,12 +40,12 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
     level=logging.INFO,
 )
-logger = logging.getLogger("sf_waiter_ai_bot_v3")
+logger = logging.getLogger("sf_waiter_ai_bot_v5")
 
 BASE_DIR = Path(__file__).resolve().parent
 DB_PATH = BASE_DIR / "bot.db"
 MENU_PATH = BASE_DIR / "sample_menu.json"
-SITE_URL = os.getenv("SF_SITE_URL", "https://shaurma-food.kz")
+SITE_URL = os.getenv("SF_SITE_URL", "https://shaurma-food.kz").rstrip("/")
 
 REGISTER_NAME, REGISTER_RESTAURANT, REGISTER_ROLE = range(3)
 
@@ -59,77 +58,34 @@ MAIN_MENU = [
 
 PROMO_SLUGS = {"promo", "promotions", "stocks", "aktsii", "action"}
 
-CATEGORY_NAME_MAP = {
-    "promo": "Акции",
-    "sets": "Сеты",
-    "combo": "Комбо",
-    "combos": "Комбо",
-    "shaurma": "Шаурма",
-    "burgers": "Бургеры",
-    "pizza": "Пицца",
-    "sushi_i_rolli": "Роллы",
-    "rolls": "Роллы",
-    "shashlyki": "Шашлыки",
-    "zavtraki": "Завтраки",
-    "soups": "Супы",
-    "vostochnaya_kukhnya": "Восточная кухня",
-    "salads": "Салаты",
-    "stejki_i_goryachee": "Стейки и горячее",
-    "kids_menu": "Детское меню",
-    "poke_udon": "Поке & Удон",
-    "zakuski_i_garniry": "Закуски и гарниры",
-    "sauces": "Соусы",
-    "desserty_i_bliny": "Десерты & Блины",
-    "drinks": "Напитки",
-    "sezonnoe_menyu": "Сезонное меню",
-    "goryachie_napitki": "Горячие напитки",
-}
-
-EMOJI_BY_NAME = {
-    "Акции": "🎁",
-    "Сеты": "🍱",
-    "Комбо": "🔥",
-    "Шаурма": "🌯",
-    "Бургеры": "🍔",
-    "Пицца": "🍕",
-    "Роллы": "🍣",
-    "Шашлыки": "🍢",
-    "Завтраки": "🍳",
-    "Супы": "🍜",
-    "Восточная кухня": "🥘",
-    "Салаты": "🥗",
-    "Стейки и горячее": "🥩",
-    "Детское меню": "👶",
-    "Поке & Удон": "🍲",
-    "Закуски и гарниры": "🍟",
-    "Соусы": "🫙",
-    "Десерты & Блины": "🧁",
-    "Напитки": "🥤",
-    "Сезонное меню": "🌟",
-    "Горячие напитки": "☕",
-}
+KNOWN_CATEGORIES = [
+    ("promo", "Акции", "🎁"),
+    ("sety", "Сеты", "🍱"),
+    ("kombo", "Комбо", "🔥"),
+    ("shaurma", "Шаурма", "🌯"),
+    ("burgers", "Бургеры", "🍔"),
+    ("pizza", "Пицца", "🍕"),
+    ("sushi_i_rolli", "Роллы", "🍣"),
+    ("shashlyki", "Шашлыки & Стейки", "🍢"),
+    ("zavtraki", "Завтраки", "🍳"),
+    ("soups", "Супы", "🍜"),
+    ("vostochnaya_kukhnya", "Восточная кухня", "🥘"),
+    ("salaty", "Салаты", "🥗"),
+    ("stejki_i_goryachee", "Стейки и горячее", "🥩"),
+    ("detskoe_menyu", "Детское меню", "👶"),
+    ("poke_udon", "Поке & Удон", "🍲"),
+    ("zakuski_i_garniry", "Закуски и гарниры", "🍟"),
+    ("sauces", "Соусы", "🫙"),
+    ("desserty_i_bliny", "Десерты & Блины", "🧁"),
+    ("drinks", "Напитки", "🥤"),
+    ("goryachie_napitki", "Горячие напитки", "☕"),
+]
 
 SALES_SCENARIOS = [
-    {
-        "id": "unknown_choice",
-        "guest_message": "Я не знаю, что взять, посоветуйте.",
-        "goal": "Сначала сузить выбор, затем предложить 1–2 позиции и допродажу.",
-    },
-    {
-        "id": "light",
-        "guest_message": "Хочу что-то лёгкое, но чтобы наесться.",
-        "goal": "Предложить более лёгкие по восприятию позиции и допродать напиток/десерт.",
-    },
-    {
-        "id": "difference",
-        "guest_message": "А в чем разница между курицей и говядиной в шаурме?",
-        "goal": "Объяснить разницу простым языком и помочь выбрать.",
-    },
-    {
-        "id": "coffee",
-        "guest_message": "Что можно взять к кофе?",
-        "goal": "Предложить 2 десерта/сладкие позиции и помочь быстро выбрать.",
-    },
+    {"id": "unknown_choice", "guest_message": "Я не знаю, что взять, посоветуйте.", "goal": "Сначала сузить выбор, затем предложить 1–2 позиции и допродажу."},
+    {"id": "light", "guest_message": "Хочу что-то лёгкое, но чтобы наесться.", "goal": "Предложить более лёгкие по восприятию позиции и допродать напиток/десерт."},
+    {"id": "difference", "guest_message": "А в чем разница между курицей и говядиной в шаурме?", "goal": "Объяснить разницу простым языком и помочь выбрать."},
+    {"id": "coffee", "guest_message": "Что можно взять к кофе?", "goal": "Предложить 2 десерта/сладкие позиции и помочь быстро выбрать."},
 ]
 
 
@@ -228,10 +184,7 @@ def save_progress(
         INSERT INTO progress (telegram_id, action_type, category, item_name, score, max_score, feedback, created_at)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         """,
-        (
-            telegram_id, action_type, category, item_name, score, max_score,
-            feedback, datetime.now().isoformat(),
-        ),
+        (telegram_id, action_type, category, item_name, score, max_score, feedback, datetime.now().isoformat()),
     )
     conn.commit()
     conn.close()
@@ -248,7 +201,6 @@ def get_user_stats(telegram_id: int) -> Dict[str, Any]:
         WHERE telegram_id = ?
     """, (telegram_id,))
     summary = cur.fetchone()
-
     cur.execute("""
         SELECT category,
                AVG(CASE WHEN max_score > 0 THEN CAST(score AS FLOAT) / max_score END) as avg_ratio,
@@ -287,14 +239,6 @@ def make_main_keyboard() -> ReplyKeyboardMarkup:
 
 def normalize_space(text: str) -> str:
     return re.sub(r"\s+", " ", text or "").strip()
-
-
-def slug_to_name(slug: str) -> str:
-    return CATEGORY_NAME_MAP.get(slug, slug.replace("_", " ").replace("-", " ").title())
-
-
-def name_to_emoji(name: str) -> str:
-    return EMOJI_BY_NAME.get(name, "🍽")
 
 
 def load_menu() -> Dict[str, Any]:
@@ -394,7 +338,7 @@ def build_item_card(item: Dict[str, Any], category_name: str, deep: bool = False
     if not deep:
         return (
             f"*{item['name']}*\n"
-            f"{name_to_emoji(category_name)} {category_name}\n"
+            f"{category_name}\n"
             f"Вес: {item.get('weight', '—')}   Цена: {item.get('price', '—')}\n\n"
             f"*Коротко для гостя:*\n{fields['pitch']}\n\n"
             f"*Что предложить дополнительно:*\n" +
@@ -403,7 +347,7 @@ def build_item_card(item: Dict[str, Any], category_name: str, deep: bool = False
 
     return (
         f"*{item['name']}*\n"
-        f"{name_to_emoji(category_name)} {category_name}\n"
+        f"{category_name}\n"
         f"Вес: {item.get('weight', '—')}   Цена: {item.get('price', '—')}\n\n"
         f"*1. Что это за позиция*\n{fields['pitch']}\n\n"
         f"*2. Состав / суть блюда*\n{fields['composition']}\n\n"
@@ -418,16 +362,12 @@ def build_item_card(item: Dict[str, Any], category_name: str, deep: bool = False
 def categories_keyboard(menu_data: Dict[str, Any], include_promo: bool = False) -> InlineKeyboardMarkup:
     buttons = []
     for category in menu_data.get("categories", []):
-        if not include_promo and category["slug"] in PROMO_SLUGS:
+        is_promo = category["slug"] in PROMO_SLUGS
+        if include_promo and not is_promo:
             continue
-        if include_promo and category["slug"] not in PROMO_SLUGS:
+        if not include_promo and is_promo:
             continue
-        buttons.append([
-            InlineKeyboardButton(
-                f"{category['emoji']} {category['name']}",
-                callback_data=f"cat:{category['slug']}"
-            )
-        ])
+        buttons.append([InlineKeyboardButton(f"{category['emoji']} {category['name']}", callback_data=f"cat:{category['slug']}")])
     return InlineKeyboardMarkup(buttons or [[InlineKeyboardButton("Нет данных", callback_data="noop")]])
 
 
@@ -460,34 +400,14 @@ def academy_keyboard(menu_data: Dict[str, Any]) -> InlineKeyboardMarkup:
 def academy_lesson_text(category: Dict[str, Any]) -> str:
     items = category.get("items", [])
     top_examples = "\n".join(f"• {x['name']} — {x.get('price', '—')}" for x in items[:6]) or "• Пока нет позиций"
-    if category["name"] == "Шаурма":
-        logic = (
-            "Эта категория продаётся через простоту выбора, сытость и понятный вкус.\n"
-            "Главная задача официанта — быстро понять: курица или говядина, обычная или поинтереснее, стандарт или побольше."
-        )
-    elif category["name"] == "Пицца":
-        logic = (
-            "Пиццу удобно продавать как решение для компании или пары.\n"
-            "Нужно понимать: классика, премиум, поострее или полегче."
-        )
-    elif category["name"] == "Роллы":
-        logic = (
-            "В роллах важна навигация: холодные, горячие, запечённые, понятные классические или наборы на компанию."
-        )
-    else:
-        logic = (
-            "Задача официанта — не перечитывать меню, а быстро переводить запрос гостя в 1–2 понятные рекомендации."
-        )
-
     return (
         f"*🎓 Академия: {category['name']}*\n\n"
-        f"*Как думать про категорию*\n{logic}\n\n"
         f"*Ключевые позиции*\n{top_examples}\n\n"
         f"*Что должен уметь официант*\n"
         f"• объяснить разницу между 2–3 основными позициями\n"
         f"• рекомендовать по запросу гостя\n"
         f"• сделать мягкую допродажу\n"
-        f"• не перегружать лишними подробностями"
+        f"• не перегружать гостя лишними деталями"
     )
 
 
@@ -605,11 +525,7 @@ async def ai_evaluate(menu_data: Dict[str, Any], scenario: Dict[str, Any], answe
         "Формат ответа строго такой:\n"
         "Оценка: X/10\n\nЧто хорошо:\n- ...\n\nЧто упущено:\n- ...\n\nКак ответить сильнее:\n- ..."
     )
-    user_prompt = json.dumps({
-        "scenario": scenario,
-        "answer": answer,
-        "menu_excerpt": compact_menu[:80],
-    }, ensure_ascii=False)
+    user_prompt = json.dumps({"scenario": scenario, "answer": answer, "menu_excerpt": compact_menu[:80]}, ensure_ascii=False)
     try:
         response = await asyncio.to_thread(
             client.chat.completions.create,
@@ -626,11 +542,11 @@ async def ai_evaluate(menu_data: Dict[str, Any], scenario: Dict[str, Any], answe
         return evaluate_locally(answer, scenario)
 
 
-def fetch_url(url: str, expect_xml: bool = False) -> str:
+def fetch_url(url: str) -> str:
     headers = {
         "User-Agent": "Mozilla/5.0 (compatible; SFWaiterBot/1.0)",
         "Accept-Language": "ru,en;q=0.9",
-        "Accept": "application/xml,text/xml,text/html;q=0.9,*/*;q=0.8" if expect_xml else "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     }
     resp = requests.get(url, headers=headers, timeout=30)
     resp.raise_for_status()
@@ -638,9 +554,9 @@ def fetch_url(url: str, expect_xml: bool = False) -> str:
 
 
 def extract_title(soup: BeautifulSoup, fallback_slug: str) -> str:
-    meta_og = soup.find("meta", attrs={"property": "og:title"})
-    if meta_og and meta_og.get("content"):
-        return normalize_space(meta_og["content"].split("|")[0])
+    og = soup.find("meta", attrs={"property": "og:title"})
+    if og and og.get("content"):
+        return normalize_space(og["content"].split("|")[0])
     h1 = soup.find("h1")
     if h1:
         return normalize_space(h1.get_text(" ", strip=True))
@@ -653,125 +569,60 @@ def extract_title(soup: BeautifulSoup, fallback_slug: str) -> str:
 def extract_composition(text: str) -> str:
     markers = ["Состав", "Ингредиенты", "Ingredients"]
     for marker in markers:
-        m = re.search(rf"{marker}\s*[:\-]?\s*(.+?)(Цена|₸|Вес|Ккал|$)", text, flags=re.I)
-        if m:
-            return normalize_space(m.group(1))[:300]
+        idx = text.lower().find(marker.lower())
+        if idx != -1:
+            return normalize_space(text[idx: idx + 320])
     return "Описание и точный состав уточняются по карточке блюда на сайте."
 
 
-def scrape_site_menu(site_url: str) -> Dict[str, Any]:
-    sitemap_urls = [
-        site_url.rstrip("/") + "/sitemap.xml",
-        site_url.rstrip("/") + "/sitemap",
-    ]
+def extract_item_links_from_category(html: str, category_slug: str) -> List[str]:
+    soup = BeautifulSoup(html, "html.parser")
+    links = []
+    for a in soup.find_all("a", href=True):
+        href = a["href"].strip()
+        full = urljoin(SITE_URL + "/", href)
+        path = urlparse(full).path.strip("/")
+        parts = path.split("/")
 
-    raw_text = None
-    last_error = None
-    for sm_url in sitemap_urls:
+        if parts[:1] == ["en"]:
+            parts = parts[1:]
+
+        if len(parts) >= 3 and parts[0] == "menu" and parts[1] == category_slug:
+            links.append(full.split("?")[0].rstrip("/"))
+
+    # unique preserve order
+    seen = set()
+    out = []
+    for link in links:
+        if link not in seen:
+            seen.add(link)
+            out.append(link)
+    return out
+
+
+def scrape_known_categories(site_url: str) -> Dict[str, Any]:
+    categories = []
+
+    for slug, name, emoji in KNOWN_CATEGORIES:
+        category_url = f"{site_url}/menu/{slug}"
         try:
-            raw_text = fetch_url(sm_url, expect_xml=True)
-            if raw_text:
-                break
-        except Exception as e:
-            last_error = e
+            html = fetch_url(category_url)
+        except Exception:
+            # some sections might be absent
+            continue
 
-    if not raw_text:
-        raise RuntimeError(f"Не удалось получить sitemap: {last_error}")
+        item_links = extract_item_links_from_category(html, slug)
+        items = []
 
-    urls: List[str] = []
-
-    # 1) Сначала пробуем нормальный XML
-    try:
-        root = ET.fromstring(raw_text)
-        tag = root.tag.lower()
-
-        if tag.endswith("urlset"):
-            for elem in root.iter():
-                if elem.tag.lower().endswith("loc") and elem.text:
-                    urls.append(elem.text.strip())
-
-        elif tag.endswith("sitemapindex"):
-            child_sitemaps = [
-                elem.text.strip()
-                for elem in root.iter()
-                if elem.tag.lower().endswith("loc") and elem.text
-            ]
-            for child in child_sitemaps[:20]:
-                try:
-                    child_xml = fetch_url(child, expect_xml=True)
-                    try:
-                        child_root = ET.fromstring(child_xml)
-                        for elem in child_root.iter():
-                            if elem.tag.lower().endswith("loc") and elem.text:
-                                urls.append(elem.text.strip())
-                    except Exception:
-                        # fallback для "грязного" дочернего sitemap
-                        urls.extend(re.findall(r"https?://[^\\s<>\\\"]+", child_xml))
-                except Exception:
-                    continue
-
-    # 2) Если XML кривой, вытаскиваем ссылки regex-ом
-    except Exception:
-        urls = re.findall(r"https?://[^\\s<>\\\"]+", raw_text)
-
-    clean_urls: List[str] = []
-    host_key = site_url.replace("https://", "").replace("http://", "").strip("/")
-
-    for url in urls:
-        url = url.strip().rstrip(",")
-        if host_key in url:
-            clean_urls.append(url.split("?")[0].rstrip("/"))
-
-    menu_urls = sorted(set(url for url in clean_urls if "/menu/" in url))
-
-    if not menu_urls:
-        raise RuntimeError("В sitemap не найдено ссылок с /menu/")
-
-    category_map: Dict[str, Dict[str, Any]] = {}
-
-    # 3) Создаём категории из URL
-    for url in menu_urls:
-        path = urlparse(url).path.strip("/")
-        parts = path.split("/")
-
-        if parts[:1] == ["en"]:
-            parts = parts[1:]
-
-        if len(parts) >= 2 and parts[0] == "menu":
-            category_slug = parts[1]
-            category_name = slug_to_name(category_slug)
-            category_map.setdefault(
-                category_slug,
-                {
-                    "slug": category_slug,
-                    "name": category_name,
-                    "emoji": name_to_emoji(category_name),
-                    "items": [],
-                },
-            )
-
-    # 4) Загружаем карточки товаров
-    for url in menu_urls:
-        path = urlparse(url).path.strip("/")
-        parts = path.split("/")
-
-        if parts[:1] == ["en"]:
-            parts = parts[1:]
-
-        if len(parts) >= 3 and parts[0] == "menu":
-            category_slug = parts[1]
-            item_slug = parts[2]
-            category = category_map.get(category_slug)
-            if not category:
-                continue
-
+        for item_url in item_links:
             try:
-                html = fetch_url(url)
+                item_html = fetch_url(item_url)
             except Exception:
                 continue
 
-            soup = BeautifulSoup(html, "html.parser")
+            soup = BeautifulSoup(item_html, "html.parser")
             text = normalize_space(soup.get_text(" ", strip=True))
+            item_slug = item_url.rstrip("/").split("/")[-1]
 
             title = extract_title(soup, item_slug)
             weight, price = parse_weight_price(text)
@@ -786,38 +637,68 @@ def scrape_site_menu(site_url: str) -> Dict[str, Any]:
                 "sell_pitch": "",
                 "upsell": [],
                 "features": [],
-                "quiz_hint": f"Позиция из категории {category['name']}.",
-                "source_url": url,
+                "quiz_hint": f"Позиция из категории {name}.",
+                "source_url": item_url,
             }
-            category["items"].append(item)
+            items.append(item)
 
-    # 5) Убираем дубли
-    categories = []
-    for category in category_map.values():
+        # fallback: if item links not found, parse category text roughly
+        if not items:
+            soup = BeautifulSoup(html, "html.parser")
+            text_lines = [normalize_space(x) for x in soup.get_text("\n", strip=True).splitlines() if normalize_space(x)]
+            for i, line in enumerate(text_lines):
+                if len(line) < 3 or len(line) > 100:
+                    continue
+                next_block = " ".join(text_lines[i:i+4])
+                weight, price = parse_weight_price(next_block)
+                if price == "—" and weight == "—":
+                    continue
+                low = line.lower()
+                if low in {"меню", "на главную", name.lower()}:
+                    continue
+                items.append({
+                    "id": make_item_id(line),
+                    "name": line,
+                    "weight": weight,
+                    "price": price,
+                    "composition": "Описание уточняется по категории на сайте.",
+                    "sell_pitch": "",
+                    "upsell": [],
+                    "features": [],
+                    "quiz_hint": f"Позиция из категории {name}.",
+                    "source_url": category_url,
+                })
+
+        # dedupe
         unique = {}
-        for item in category["items"]:
+        for item in items:
             key = item["name"].lower().strip()
             if key and key not in unique:
                 unique[key] = item
-        category["items"] = list(unique.values())
-        if category["items"]:
-            category["items"].sort(key=lambda x: x["name"])
-            categories.append(category)
+        final_items = list(unique.values())
 
-    categories.sort(key=lambda x: x["name"])
+        if final_items:
+            final_items.sort(key=lambda x: x["name"])
+            categories.append({
+                "slug": slug,
+                "name": name,
+                "emoji": emoji,
+                "items": final_items,
+            })
 
     if not categories:
-        raise RuntimeError("Не удалось собрать ни одной категории с позициями.")
+        raise RuntimeError("Не удалось собрать категории с известных страниц меню.")
 
+    categories.sort(key=lambda x: x["name"])
     return {
         "brand": "SF Shaurma Food",
-        "source_note": f"Синхронизировано с сайта {datetime.now().strftime('%Y-%m-%d %H:%M')}",
+        "source_note": f"Синхронизировано по известным категориям сайта {datetime.now().strftime('%Y-%m-%d %H:%M')}",
         "categories": categories,
     }
 
 
 async def sync_menu_from_site(context: ContextTypes.DEFAULT_TYPE) -> Dict[str, Any]:
-    menu_data = await asyncio.to_thread(scrape_site_menu, SITE_URL)
+    menu_data = await asyncio.to_thread(scrape_known_categories, SITE_URL)
     if menu_data.get("categories"):
         save_menu(menu_data)
         context.bot_data["menu_data"] = menu_data
@@ -852,13 +733,7 @@ async def register_restaurant(update: Update, context: ContextTypes.DEFAULT_TYPE
 async def register_role(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     role = update.message.text.strip().lower()
     is_admin = 1 if role in {"администратор", "директор", "admin", "manager"} else 0
-    upsert_employee(
-        update.effective_user.id,
-        context.user_data["full_name"],
-        context.user_data["restaurant"],
-        role,
-        is_admin
-    )
+    upsert_employee(update.effective_user.id, context.user_data["full_name"], context.user_data["restaurant"], role, is_admin)
     await update.message.reply_text("Готово. Ты внутри SF Academy.", reply_markup=make_main_keyboard())
     return ConversationHandler.END
 
@@ -881,27 +756,15 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
 
     if text == "🍽 Меню":
-        await update.message.reply_text(
-            "*Меню*\nВыбери категорию, чтобы открыть позиции.",
-            parse_mode=ParseMode.MARKDOWN,
-            reply_markup=categories_keyboard(menu_data, include_promo=False),
-        )
+        await update.message.reply_text("*Меню*\nВыбери категорию, чтобы открыть позиции.", parse_mode=ParseMode.MARKDOWN, reply_markup=categories_keyboard(menu_data, include_promo=False))
         return
 
     if text == "🎁 Акции":
-        await update.message.reply_text(
-            "*Акции и промо*\nЗдесь собраны спецпредложения и акционные позиции.",
-            parse_mode=ParseMode.MARKDOWN,
-            reply_markup=categories_keyboard(menu_data, include_promo=True),
-        )
+        await update.message.reply_text("*Акции и промо*\nЗдесь собраны спецпредложения и акционные позиции.", parse_mode=ParseMode.MARKDOWN, reply_markup=categories_keyboard(menu_data, include_promo=True))
         return
 
     if text == "🎓 Академия меню":
-        await update.message.reply_text(
-            "*Академия меню*\nВыбери категорию для глубокого изучения логики продаж.",
-            parse_mode=ParseMode.MARKDOWN,
-            reply_markup=academy_keyboard(menu_data),
-        )
+        await update.message.reply_text("*Академия меню*\nВыбери категорию для глубокого изучения логики продаж.", parse_mode=ParseMode.MARKDOWN, reply_markup=academy_keyboard(menu_data))
         return
 
     if text == "🧪 Тесты":
@@ -926,10 +789,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         context.user_data["sales_scenario"] = scenario
         context.user_data["awaiting_ai_answer"] = True
         await update.message.reply_text(
-            f"*Сценарий гостя*\n\n"
-            f"Гость: _{scenario['guest_message']}_\n\n"
-            f"*Задача:* {scenario['goal']}\n\n"
-            f"Напиши свой ответ как официант.",
+            f"*Сценарий гостя*\n\nГость: _{scenario['guest_message']}_\n\n*Задача:* {scenario['goal']}\n\nНапиши свой ответ как официант.",
             parse_mode=ParseMode.MARKDOWN,
         )
         return
@@ -938,15 +798,9 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         stats = get_user_stats(update.effective_user.id)
         s = stats["summary"]
         percent = round((s["total_score"] / s["total_max"]) * 100) if s["total_max"] else 0
-        weak = "\n".join(
-            f"• {x['category']} — {round((x['avg_ratio'] or 0)*100)}% ({x['cnt']} актив.)"
-            for x in stats["categories"][:5]
-        ) or "• Пока мало данных"
+        weak = "\n".join(f"• {x['category']} — {round((x['avg_ratio'] or 0)*100)}% ({x['cnt']} актив.)" for x in stats["categories"][:5]) or "• Пока мало данных"
         await update.message.reply_text(
-            f"*Твой прогресс*\n\n"
-            f"Активностей: {s['total_actions']}\n"
-            f"Средний результат: {percent}%\n\n"
-            f"*Где нужно усилиться*\n{weak}",
+            f"*Твой прогресс*\n\nАктивностей: {s['total_actions']}\nСредний результат: {percent}%\n\n*Где нужно усилиться*\n{weak}",
             parse_mode=ParseMode.MARKDOWN,
         )
         return
@@ -958,10 +812,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         rows = get_network_stats()
         lines = ["*Админ-панель*\n", "*Сеть по ресторанам:*"]
         for row in rows:
-            lines.append(
-                f"• {row['restaurant']}: сотрудников {row['employees']}, "
-                f"активностей {row['activities']}, средний результат {round(row['avg_ratio']*100)}%"
-            )
+            lines.append(f"• {row['restaurant']}: сотрудников {row['employees']}, активностей {row['activities']}, средний результат {round(row['avg_ratio']*100)}%")
         lines.append("\nКоманды:\n/sync_site — обновить меню с сайта\n/menu_stats — показать статистику меню")
         await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
         return
@@ -976,10 +827,7 @@ async def send_next_question(update: Update, context: ContextTypes.DEFAULT_TYPE)
         score = context.user_data.get("quiz_score", 0)
         max_score = len(questions)
         mode = context.user_data.get("quiz_mode", "quiz")
-        save_progress(
-            update.effective_user.id, mode, "mixed", None, score, max_score,
-            f"Завершено: {score}/{max_score}"
-        )
+        save_progress(update.effective_user.id, mode, "mixed", None, score, max_score, f"Завершено: {score}/{max_score}")
         title = "Экзамен дня" if mode == "daily_exam" else "Тест"
         if update.callback_query:
             await update.callback_query.edit_message_text(f"{title} завершён.\nРезультат: {score}/{max_score}")
@@ -1030,11 +878,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         if not category:
             await query.edit_message_text("Категория не найдена.")
             return
-        await query.edit_message_text(
-            f"*{category['emoji']} {category['name']}*\nВыбери позицию.",
-            parse_mode=ParseMode.MARKDOWN,
-            reply_markup=items_keyboard(category, mode="browse"),
-        )
+        await query.edit_message_text(f"*{category['emoji']} {category['name']}*\nВыбери позицию.", parse_mode=ParseMode.MARKDOWN, reply_markup=items_keyboard(category, mode="browse"))
         return
 
     if data.startswith("academy:"):
@@ -1058,11 +902,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if data.startswith("academy_items:"):
         slug = data.split(":", 1)[1]
         category = get_category_by_slug(menu_data, slug)
-        await query.edit_message_text(
-            f"*Позиции категории {category['name']}*\nВыбери блюдо для детального разбора.",
-            parse_mode=ParseMode.MARKDOWN,
-            reply_markup=items_keyboard(category, mode="academy"),
-        )
+        await query.edit_message_text(f"*Позиции категории {category['name']}*\nВыбери блюдо для детального разбора.", parse_mode=ParseMode.MARKDOWN, reply_markup=items_keyboard(category, mode="academy"))
         return
 
     if data.startswith("item:"):
@@ -1073,11 +913,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             await query.edit_message_text("Позиция не найдена.")
             return
         save_progress(update.effective_user.id, "menu_view", category["name"], item["name"], 1, 1, "Открыта карточка блюда")
-        await query.edit_message_text(
-            build_item_card(item, category["name"], deep=False),
-            parse_mode=ParseMode.MARKDOWN,
-            reply_markup=item_actions_keyboard(slug, item_id),
-        )
+        await query.edit_message_text(build_item_card(item, category["name"], deep=False), parse_mode=ParseMode.MARKDOWN, reply_markup=item_actions_keyboard(slug, item_id))
         return
 
     if data.startswith("deep:"):
@@ -1088,11 +924,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             await query.edit_message_text("Позиция не найдена.")
             return
         save_progress(update.effective_user.id, "deep_learning", category["name"], item["name"], 1, 1, "Глубокое изучение блюда")
-        await query.edit_message_text(
-            build_item_card(item, category["name"], deep=True),
-            parse_mode=ParseMode.MARKDOWN,
-            reply_markup=item_actions_keyboard(slug, item_id),
-        )
+        await query.edit_message_text(build_item_card(item, category["name"], deep=True), parse_mode=ParseMode.MARKDOWN, reply_markup=item_actions_keyboard(slug, item_id))
         return
 
     if data.startswith("sell:"):
@@ -1126,11 +958,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         context.user_data["microquiz_item"] = item["name"]
         kb = [[InlineKeyboardButton(opt, callback_data=f"microans:{opt}")] for opt in options]
         kb.append([InlineKeyboardButton("⬅️ Назад к блюду", callback_data=f"deep:{slug}:{item_id}")])
-        await query.edit_message_text(
-            f"*Мини-вопрос*\nКакое блюдо подходит под описание:\n_{item.get('quiz_hint', 'Позиция из этой категории')}_",
-            parse_mode=ParseMode.MARKDOWN,
-            reply_markup=InlineKeyboardMarkup(kb),
-        )
+        await query.edit_message_text(f"*Мини-вопрос*\nКакое блюдо подходит под описание:\n_{item.get('quiz_hint', 'Позиция из этой категории')}_", parse_mode=ParseMode.MARKDOWN, reply_markup=InlineKeyboardMarkup(kb))
         return
 
     if data.startswith("microans:"):
@@ -1140,10 +968,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         item_name = context.user_data.get("microquiz_item")
         ok = answer == right
         save_progress(update.effective_user.id, "microquiz", category_name, item_name, 1 if ok else 0, 1, "Мини-вопрос")
-        await query.edit_message_text(
-            f"{'✅ Верно' if ok else '❌ Неверно'}\nПравильный ответ: *{right}*",
-            parse_mode=ParseMode.MARKDOWN,
-        )
+        await query.edit_message_text(f"{'✅ Верно' if ok else '❌ Неверно'}\nПравильный ответ: *{right}*", parse_mode=ParseMode.MARKDOWN)
         return
 
     if data.startswith("academy_quiz:"):
@@ -1185,10 +1010,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         if ok:
             context.user_data["quiz_score"] = context.user_data.get("quiz_score", 0) + 1
         context.user_data["quiz_index"] = idx + 1
-        await query.edit_message_text(
-            f"{'✅ Верно' if ok else '❌ Неверно'}\nПравильный ответ: *{current['answer']}*",
-            parse_mode=ParseMode.MARKDOWN,
-        )
+        await query.edit_message_text(f"{'✅ Верно' if ok else '❌ Неверно'}\nПравильный ответ: *{current['answer']}*", parse_mode=ParseMode.MARKDOWN)
         await send_next_question(update, context)
         return
 
@@ -1198,7 +1020,7 @@ async def cmd_sync_site(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     if not employee or not employee["is_admin"]:
         await update.message.reply_text("Команда доступна администратору или директору.")
         return
-    await update.message.reply_text("Запускаю синхронизацию с сайтом. Это может занять до минуты.")
+    await update.message.reply_text("Запускаю синхронизацию с известными категориями сайта. Это может занять до 1–2 минут.")
     try:
         menu_data = await sync_menu_from_site(context)
         await update.message.reply_text("✅ Меню обновлено.\n" + site_sync_summary(menu_data))
